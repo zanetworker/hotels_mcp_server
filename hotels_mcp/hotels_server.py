@@ -1,64 +1,64 @@
-import json
+import asyncio
 import httpx
 import logging
 import signal
 import sys
-import argparse
-from typing import Dict, List, Any, Optional
-from mcp.server.fastmcp import FastMCP
-from dotenv import load_dotenv
 import os
+from typing import Dict, Any, Optional
+from mcp.server.fastmcp import FastMCP
 
-# Load environment variables
-load_dotenv()
-
-# Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    level=logging.WARNING,
+    format='%(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stderr)]
 )
 logger = logging.getLogger("hotels-mcp-server")
 
-# Initialize FastMCP server
 mcp = FastMCP("hotels")
 
-# Constants
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+RAPIDAPI_KEY = os.getenv("RAPID_API") or os.getenv("RAPIDAPI_KEY") or ""
 RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "booking-com15.p.rapidapi.com")
 
-# Validate required environment variables
-if not RAPIDAPI_KEY:
-    logger.error("RAPIDAPI_KEY environment variable is not set. Please create a .env file with your API key.")
-    sys.exit(1)
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2.0
 
 async def make_rapidapi_request(endpoint: str, params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    """Make a request to the RapidAPI with proper error handling."""
+    if not RAPIDAPI_KEY:
+        return {"error": "RAPID_API environment variable is not set"}
     url = f"https://{RAPIDAPI_HOST}{endpoint}"
-    
+
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
         "X-RapidAPI-Host": RAPIDAPI_HOST
     }
-    
+
     logger.info(f"Making API request to {endpoint} with params: {params}")
     async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url, headers=headers, params=params, timeout=30.0)
-            response.raise_for_status()
-            logger.info(f"API request to {endpoint} successful")
-            return response.json()
-        except Exception as e:
-            logger.error(f"API request to {endpoint} failed: {str(e)}")
-            return {"error": str(e)}
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                response = await client.get(url, headers=headers, params=params, timeout=30.0)
+                if response.status_code == 429:
+                    if attempt < MAX_RETRIES:
+                        retry_after = float(response.headers.get("Retry-After", RETRY_BASE_DELAY * (2 ** attempt)))
+                        logger.warning(f"Rate limited on {endpoint}, retrying in {retry_after}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                        await asyncio.sleep(retry_after)
+                        continue
+                response.raise_for_status()
+                logger.info(f"API request to {endpoint} successful")
+                return response.json()
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429 and attempt < MAX_RETRIES:
+                    continue
+                logger.error(f"API request to {endpoint} failed: {str(e)}")
+                return {"error": str(e)}
+            except Exception as e:
+                logger.error(f"API request to {endpoint} failed: {str(e)}")
+                return {"error": str(e)}
+    return {"error": f"Rate limited after {MAX_RETRIES} retries"}
 
 @mcp.tool()
 async def search_destinations(query: str) -> str:
-    """Search for hotel destinations by name.
-    
-    Args:
-        query: The destination to search for (e.g., "Paris", "New York", "Tokyo")
-    """
+    """Search Booking.com destinations by name. Returns dest_id values needed by get_hotels."""
     logger.info(f"Searching for destinations with query: {query}")
     endpoint = "/api/v1/hotels/searchDestination"
     params = {"query": query}
@@ -93,14 +93,7 @@ async def search_destinations(query: str) -> str:
 
 @mcp.tool()
 async def get_hotels(destination_id: str, checkin_date: str, checkout_date: str, adults: int = 2) -> str:
-    """Get hotels for a specific destination.
-    
-    Args:
-        destination_id: The destination ID (city_ufi from search_destinations)
-        checkin_date: Check-in date in YYYY-MM-DD format
-        checkout_date: Check-out date in YYYY-MM-DD format
-        adults: Number of adults (default: 2)
-    """
+    """List hotels for a destination. Use dest_id from search_destinations. Dates are YYYY-MM-DD."""
     logger.info(f"Getting hotels for destination_id: {destination_id}, checkin: {checkin_date}, checkout: {checkout_date}, adults: {adults}")
     endpoint = "/api/v1/hotels/searchHotels"
     params = {
@@ -206,25 +199,14 @@ def handle_shutdown(signum, frame):
     sys.exit(0)
 
 def main():
-    """Main function to run the Hotels MCP server."""
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Hotels MCP Server')
-    args = parser.parse_args()
-    
-    # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
-    
     try:
-        # Use STDIO transport - it's the most reliable for Claude for Desktop
-        logger.info("Starting Hotels MCP Server with stdio transport...")
         mcp.run(transport='stdio')
         return 0
     except Exception as e:
-        logger.error(f"Error starting server: {str(e)}")
+        logger.error(f"Server error: {e}")
         return 1
-    finally:
-        logger.info("Hotels MCP Server shutting down...")
 
 if __name__ == "__main__":
     sys.exit(main()) 
